@@ -8,17 +8,13 @@ M.sessionspath = M.datapath .. "/neovim-sessions" --directory
 M.homedir = nil
 M.dir_pretty = nil -- directory of current project (respects user defined symlinks in config)
 
----Convert glob-style wildcards to Lua pattern
+---Convert glob-style wildcard to an LPeg pattern using `vim.glob.to_lpeg`
 ---@param wildcard string wildcard string
 ---@param resolve boolean whether or not to resolve symlinks for the "prefix"
----@param eol boolean? whether or not to add `$` at the end of the pattern, default is true
----@return string converted Lua pattern
-local function wildcard_to_pattern(wildcard, resolve, eol)
+---@return vim.lpeg.Pattern? converted LPeg pattern, or nil for an invalid glob
+local function wildcard_to_lpeg(wildcard, resolve)
   if not wildcard or wildcard == "" then
-    return ""
-  end
-  if eol == nil then
-    eol = true
+    return nil
   end
 
   -- Expand to absolute path, fnamemodify can work with wildcards
@@ -33,85 +29,12 @@ local function wildcard_to_pattern(wildcard, resolve, eol)
     pattern = vim.fn.resolve(pattern)
   end
 
-  -- Escape special characters for Lua patterns (except wildcards we need to handle specially)
-  pattern = pattern:gsub("([%%%.%+%-%$%^%(%)%]])", "%%%1")
-
-  -- Handle the beginning of the pattern
-  local start_pattern = "^"
-
-  -- Keep track of current position
-  local i = 1
-  local len = #pattern
-  local result = start_pattern
-
-  while i <= len do
-    local c = pattern:sub(i, i)
-
-    if c == "?" then
-      -- ? matches one character, but not path separators
-      result = result .. "[^/\\]"
-      i = i + 1
-    elseif c == "*" then
-      if i < len and pattern:sub(i + 1, i + 1) == "*" then
-        -- ** recursively matches all directories
-        if i + 2 <= len and (pattern:sub(i + 2, i + 2) == "/" or pattern:sub(i + 2, i + 2) == "\\") then
-          -- Handle **/ or **\ patterns, match any level of directories
-          result = result .. ".*"
-          i = i + 3
-        else
-          -- Standalone ** treated as *
-          if i == 1 or pattern:sub(i - 1, i - 1) == "." then
-            -- Patterns starting with .* can match hidden files
-            result = result .. ".*"
-          else
-            -- * doesn't match files starting with a dot (nosuf=true)
-            result = result .. "([^.][^/\\]*)"
-          end
-          i = i + 2
-        end
-      else
-        -- Single * case
-        if i == 1 or pattern:sub(i - 1, i - 1) == "." then
-          -- Patterns starting with .* can match hidden files
-          result = result .. "[^/\\]*"
-        else
-          -- * doesn't match files starting with a dot (nosuf=true)
-          result = result .. "([^.][^/\\]*)"
-        end
-        i = i + 1
-      end
-    elseif c == "[" then
-      -- Handle [abc] character classes
-      local closing = pattern:find("]", i + 1)
-      if closing then
-        if pattern:sub(i + 1, i + 1) == "!" then
-          -- Handle [!abc] character classes
-          result = result .. "[^"
-          i = i + 2
-        end
-        result = result .. pattern:sub(i, closing)
-        i = closing + 1
-      else
-        -- No closing bracket found, treat as a normal character
-        result = result .. "%["
-        i = i + 1
-      end
-    elseif c == "/" or c == "\\" then
-      -- Handle path separators uniformly
-      result = result .. "[/\\]"
-      i = i + 1
-    else
-      -- Normal characters
-      result = result .. c
-      i = i + 1
-    end
+  -- `vim.glob.to_lpeg` throws on an invalid glob, treat it as no match
+  local ok, lpeg_pattern = pcall(vim.glob.to_lpeg, pattern)
+  if not ok then
+    return nil
   end
-
-  if eol then
-    result = result .. "$" -- Add ending anchor
-  end
-
-  return result
+  return lpeg_pattern
 end
 
 local function is_subdirectory(parent, sub)
@@ -277,13 +200,24 @@ local find_longest_matched_pattern = function(patterns, dir, resolve)
   local longest_pattern = nil
   local longest_length = 0
   for _, pattern in ipairs(patterns) do
-    local lua_pattern = wildcard_to_pattern(pattern, resolve, false)
-    local startindex, endindex = dir:find(lua_pattern)
-    if startindex ~= nil and endindex ~= nil then
-      local len = endindex - startindex + 1
-      if len > longest_length then
-        longest_length = len
-        longest_pattern = pattern
+    local lpeg_pattern = wildcard_to_lpeg(pattern, resolve)
+    if lpeg_pattern then
+      -- `vim.glob.to_lpeg` matches the whole string, so emulate the previous
+      -- prefix matching by testing each ancestor of `dir` (longest first)
+      local dir_prefix = dir
+      while true do
+        if lpeg_pattern:match(dir_prefix) then
+          local len = #dir_prefix
+          if len > longest_length then
+            longest_length = len
+            longest_pattern = pattern
+          end
+          break
+        end
+        if dir_prefix == "" then
+          break
+        end
+        dir_prefix = dir_prefix:gsub("[/\\][^/\\]*$", "")
       end
     end
   end
@@ -339,26 +273,31 @@ M.fix_symlinks_for_history = function(dirs)
     for i, dir in ipairs(dirs) do
       local dir_resolved
       for _, pattern in ipairs(patterns) do
-        local lua_pattern = wildcard_to_pattern(pattern, resolve, true)
-        local startindex, endindex
-        if dir_resolved == nil then
-          startindex, endindex = dir:find(lua_pattern)
-          if startindex == nil or endindex == nil then
-            dir_resolved = M.resolve(dir)
-            startindex, endindex = dir_resolved:find(lua_pattern)
-          end
-        else
-          startindex, endindex = dir_resolved:find(lua_pattern)
-        end
-        if startindex ~= nil and endindex ~= nil then
-          local projects = M.get_all_projects({ pattern })
-          for _, path in ipairs(projects) do
-            if path == dir_resolved or M.resolve(path) == dir_resolved then
-              dirs[i] = path
-              break
+        local lpeg_pattern = wildcard_to_lpeg(pattern, resolve)
+        if lpeg_pattern then
+          local matched
+          if dir_resolved == nil then
+            if lpeg_pattern:match(dir) then
+              matched = true
+            else
+              dir_resolved = M.resolve(dir)
+              if lpeg_pattern:match(dir_resolved) then
+                matched = true
+              end
             end
+          elseif lpeg_pattern:match(dir_resolved) then
+            matched = true
           end
-          break
+          if matched then
+            local projects = M.get_all_projects({ pattern })
+            for _, path in ipairs(projects) do
+              if path == dir_resolved or M.resolve(path) == dir_resolved then
+                dirs[i] = path
+                break
+              end
+            end
+            break
+          end
         end
       end
     end
